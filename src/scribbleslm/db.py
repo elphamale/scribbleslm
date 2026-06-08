@@ -20,10 +20,15 @@ def get_db_url() -> str:
 
 async def get_conn() -> psycopg.AsyncConnection:
     global _pool
-    if _pool is None or _pool.closed:
-        _pool = await psycopg.AsyncConnection.connect(
-            get_db_url(), row_factory=dict_row, autocommit=False
-        )
+    if _pool is not None and not _pool.closed:
+        try:
+            await _pool.execute("SELECT 1")
+            return _pool
+        except Exception:
+            _pool = None
+    _pool = await psycopg.AsyncConnection.connect(
+        get_db_url(), row_factory=dict_row, autocommit=False
+    )
     return _pool
 
 

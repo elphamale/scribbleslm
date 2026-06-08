@@ -1,19 +1,9 @@
-import os
-from openai import AsyncOpenAI
-
 from .db import get_conn
-from .ingest import embed_texts, validate_embedding_dim
+from .ingest import embed, validate_embedding_dim
 
 
 async def query_notebook(notebook_id: str, query: str, top_k: int = 10) -> list[dict]:
-    client = AsyncOpenAI(
-        base_url=os.environ["EMBEDDING_BASE_URL"],
-        api_key=os.environ["EMBEDDING_API_KEY"],
-    )
-    model = os.environ["EMBEDDING_MODEL"]
-
-    embeddings = await embed_texts(client, model, [query])
-    query_embedding = embeddings[0]
+    query_embedding = await embed(query)
     await validate_embedding_dim(len(query_embedding))
 
     conn = await get_conn()
