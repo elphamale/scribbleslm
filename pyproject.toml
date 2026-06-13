@@ -10,6 +10,8 @@ dependencies = [
   "sqlite-vec",        # vector index
   "llama-cpp-python",  # local bge-m3-GGUF, private path
   "tenacity",          # backoff for the async dispatcher (R1)
+  "regex",             # per-pattern timeout for induced profiles (D)
+  "pyyaml",            # profile cache serialization (D)
   "trafilatura",
   "pymupdf",
   "tiktoken",

@@ -1,0 +1,10 @@
+# Pre-warmed cache entry (rung 2) for Ukrainian statutes (ККУ, ПКУ, …).
+# Deletable — induction will re-derive an equivalent profile via rung-3 line mining.
+name: ukrainian_statute
+rung: shipped
+fingerprint: "стаття|<NUM>"
+levels:
+  - name: розділ
+    pattern: "Розділ\\s+([IVXLCDM]+)"
+  - name: стаття
+    pattern: "Стаття\\s+(\\d+(?:[.\\-]\\d+)*)"

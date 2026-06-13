@@ -46,6 +46,10 @@ class Settings:
     # routing default
     default_private: bool
 
+    # induction (Milestone D)
+    profile_cache_dir: Path
+    profile_synthesis: bool   # rung-4 LLM profile synthesis (default on)
+
 
 def _load_dotenv() -> None:
     """Populate os.environ from a .env file (cwd or ~/.scribbleslm), without
@@ -83,6 +87,8 @@ def get_settings() -> Settings:
         context_llm_api_key=os.environ.get("CONTEXT_LLM_API_KEY"),
         context_llm_model=os.environ.get("CONTEXT_LLM_MODEL"),
         default_private=_bool(os.environ.get("DEFAULT_PRIVATE"), False),
+        profile_cache_dir=_expand(os.environ.get("PROFILE_CACHE_DIR", str(home / "profiles"))),
+        profile_synthesis=_bool(os.environ.get("PROFILE_SYNTHESIS"), True),
     )
 
 
