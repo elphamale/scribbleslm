@@ -1,186 +1,163 @@
-import asyncio
+"""Ingest-now / enrich-later pipeline (Milestone B).
+
+source_add path: fetch -> hash -> chunk -> window -> stream(embed + store) and
+return. No DeepSeek inline. Chunks are queryable as each window lands.
+
+- PUBLIC sources -> voyage-context-3: embeddings are natively contextual, so
+  chunks are marked 'enriched' immediately (no DeepSeek pass).
+- PRIVATE sources -> bge-m3-GGUF: embedded on raw text, marked 'pending';
+  enrich_source() later runs DeepSeek contextualization (private path only),
+  re-embeds, and marks 'enriched' (or 'failed').
+"""
+from __future__ import annotations
+
 import hashlib
-import os
-import random
+import sqlite3
 
-import httpx
 import tiktoken
-from openai import AsyncOpenAI
 
-from .db import get_conn, config_get, config_set
+from . import costs, db
+from .config import Settings
+from .routing import Router
 from .sources import fetch_source
-
 
 CHUNK_TOKENS = 512
 OVERLAP_TOKENS = 100
-WINDOW_TOKENS = 2000   # tokens of surrounding context sent to DeepSeek
-CONCURRENCY = 8        # DeepSeek concurrent calls
-EMBED_CONCURRENCY = 4  # Ollama concurrent calls
+WINDOW_CHUNKS = 50           # context-3 atomic window (~25.6K tok < 30K limit)
+CONTEXT_NEIGHBORS = 4        # +/- chunks used as DeepSeek context window (private)
 
-
-def _ollama_base_url() -> str:
-    return os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
-
-
-def _make_context_client() -> AsyncOpenAI:
-    return AsyncOpenAI(
-        base_url=os.environ["CONTEXT_LLM_BASE_URL"],
-        api_key=os.environ["CONTEXT_LLM_API_KEY"],
-    )
-
-
-def _get_enc():
-    return tiktoken.get_encoding("cl100k_base")
+_enc = tiktoken.get_encoding("cl100k_base")
 
 
 def chunk_text(text: str) -> tuple[list[str], list[int], list[int]]:
-    """Returns (chunks, token_starts, token_ends)."""
-    enc = _get_enc()
-    tokens = enc.encode(text)
+    toks = _enc.encode(text)
     chunks, starts, ends = [], [], []
-    start = 0
-    while start < len(tokens):
-        end = min(start + CHUNK_TOKENS, len(tokens))
-        chunks.append(enc.decode(tokens[start:end]))
-        starts.append(start)
-        ends.append(end)
-        if end == len(tokens):
+    s = 0
+    while s < len(toks):
+        e = min(s + CHUNK_TOKENS, len(toks))
+        chunks.append(_enc.decode(toks[s:e]))
+        starts.append(s)
+        ends.append(e)
+        if e == len(toks):
             break
-        start += CHUNK_TOKENS - OVERLAP_TOKENS
+        s += CHUNK_TOKENS - OVERLAP_TOKENS
     return chunks, starts, ends
 
 
-def extract_window(doc_tokens: list[int], chunk_start: int, chunk_end: int) -> str:
-    enc = _get_enc()
-    win_start = max(0, chunk_start - WINDOW_TOKENS)
-    win_end = min(len(doc_tokens), chunk_end + WINDOW_TOKENS)
-    return enc.decode(doc_tokens[win_start:win_end])
+def _windows(n: int, size: int = WINDOW_CHUNKS):
+    for i in range(0, n, size):
+        yield i, min(i + size, n)
 
 
-_embed_sem = asyncio.Semaphore(EMBED_CONCURRENCY)
-
-
-async def embed(text: str) -> list[float]:
-    model = os.environ.get("OLLAMA_EMBEDDING_MODEL", "bge-m3")
-    async with _embed_sem:
-        async with httpx.AsyncClient() as client:
-            response = await client.post(
-                f"{_ollama_base_url()}/api/embeddings",
-                json={"model": model, "prompt": text},
-                timeout=60.0,
-            )
-            response.raise_for_status()
-            return response.json()["embedding"]
-
-
-async def validate_embedding_dim(actual_dim: int) -> None:
-    stored = await config_get("embedding_dim")
-    if stored is None:
-        await config_set("embedding_dim", str(actual_dim))
-    elif int(stored) != actual_dim:
-        raise ValueError(
-            f"Embedding dimension mismatch: stored {stored}, got {actual_dim}. "
-            "Drop and recreate the database to switch models."
-        )
-
-
-async def _call_context_llm_with_backoff(
-    client: AsyncOpenAI,
-    model: str,
-    window: str,
-    chunk_text_str: str,
-    max_retries: int = 6,
-) -> str:
-    delay = 1.0
-    for attempt in range(max_retries):
-        try:
-            response = await client.chat.completions.create(
-                model=model,
-                messages=[
-                    {"role": "system", "content": "You are a helpful assistant."},
-                    {
-                        "role": "user",
-                        "content": (
-                            f"<context>\n{window}\n</context>\n\n"
-                            f"<chunk>\n{chunk_text_str}\n</chunk>\n\n"
-                            "Give a short succinct context to situate this chunk within the "
-                            "broader document for search retrieval purposes. Answer only with "
-                            "the context, nothing else."
-                        ),
-                    },
-                ],
-                max_tokens=200,
-            )
-            return response.choices[0].message.content.strip()
-        except Exception as e:
-            if "429" in str(e) or "rate" in str(e).lower():
-                if attempt == max_retries - 1:
-                    raise
-                jitter = random.uniform(0, delay * 0.3)
-                await asyncio.sleep(delay + jitter)
-                delay = min(delay * 2, 60.0)
-            else:
-                raise
-    raise RuntimeError("Max retries exceeded on context LLM call")
-
-
-async def _contextualize_chunk(
-    sem: asyncio.Semaphore,
-    client: AsyncOpenAI,
-    model: str,
-    doc_tokens: list[int],
-    chunk_text_str: str,
-    chunk_start: int,
-    chunk_end: int,
-) -> str:
-    async with sem:
-        window = extract_window(doc_tokens, chunk_start, chunk_end)
-        ctx = await _call_context_llm_with_backoff(client, model, window, chunk_text_str)
-        return f"{ctx}\n\n{chunk_text_str}"
-
-
-async def ingest_source(
-    notebook_id: str,
-    source_id: str,
-    url: str,
-) -> tuple[int, str]:
-    """Returns (chunk_count, content_hash)."""
+async def ingest_source(conn: sqlite3.Connection, router: Router, settings: Settings,
+                        notebook_id: int, source_id: int, url: str, private: bool) -> dict:
+    """Stream embed+store. Returns summary; commits per window (progressive)."""
     doc_text = fetch_source(url)
     content_hash = hashlib.sha256(doc_text.encode()).hexdigest()
-
-    enc = _get_enc()
-    doc_tokens = enc.encode(doc_text)
-
     chunks, starts, ends = chunk_text(doc_text)
 
-    context_client = _make_context_client()
-    context_model = os.environ["CONTEXT_LLM_MODEL"]
+    backend_id: str | None = None
+    eff_private = router.effective_private(private)
+    status = "pending" if eff_private else "enriched"  # public = context-3 native
+    total = 0
 
-    sem = asyncio.Semaphore(CONCURRENCY)
-    contextualized_chunks = await asyncio.gather(
-        *[
-            _contextualize_chunk(sem, context_client, context_model, doc_tokens, chunk, start, end)
-            for chunk, start, end in zip(chunks, starts, ends)
-        ]
+    for a, b in _windows(len(chunks)):
+        window = chunks[a:b]
+        vecs, backend_id, _ = await router.embed_source(source_id, private, [window])
+        win_vecs = vecs[0]
+        db.ensure_vec_table(conn, backend_id, len(win_vecs[0]))
+        win_tokens = 0
+        for j, (text, vec) in enumerate(zip(window, win_vecs)):
+            idx = a + j
+            cid = conn.execute(
+                "INSERT INTO chunks(source_id, notebook_id, backend_id, chunk_index, "
+                "token_start, token_end, original_text, enrichment_status) "
+                "VALUES(?,?,?,?,?,?,?,?) RETURNING id",
+                (source_id, notebook_id, backend_id, idx, starts[idx], ends[idx], text, status),
+            ).fetchone()["id"]
+            db.insert_vector(conn, backend_id, cid, vec)
+            db.insert_fts(conn, cid, text)
+            win_tokens += ends[idx] - starts[idx]
+        conn.commit()  # stream: this window is now queryable
+        costs.record_cost(conn, source_id, backend_id, api_calls=1, input_tokens=win_tokens)
+        total += len(window)
+
+    conn.execute("UPDATE sources SET content_hash=?, backend_id=?, private=? WHERE id=?",
+                 (content_hash, backend_id, int(eff_private), source_id))
+    conn.commit()
+    return {"chunk_count": total, "content_hash": content_hash,
+            "backend_id": backend_id, "status": status, "private": eff_private}
+
+
+def _context_client(settings: Settings):
+    if not (settings.context_llm_base_url and settings.context_llm_api_key
+            and settings.context_llm_model):
+        raise RuntimeError(
+            "CONTEXT_LLM_BASE_URL/API_KEY/MODEL must be set to enrich private sources."
+        )
+    from openai import AsyncOpenAI
+    return AsyncOpenAI(base_url=settings.context_llm_base_url,
+                       api_key=settings.context_llm_api_key)
+
+
+async def _gen_context(client, model: str, window: str, chunk: str) -> tuple[str, int, int]:
+    resp = await client.chat.completions.create(
+        model=model,
+        messages=[
+            {"role": "system", "content": "You are a helpful assistant."},
+            {"role": "user", "content": (
+                f"<context>\n{window}\n</context>\n\n<chunk>\n{chunk}\n</chunk>\n\n"
+                "Give a short succinct context to situate this chunk within the broader "
+                "document for search retrieval purposes. Answer only with the context, "
+                "nothing else."
+            )},
+        ],
+        max_tokens=200,
     )
+    u = resp.usage
+    return (resp.choices[0].message.content.strip(),
+            getattr(u, "prompt_tokens", 0), getattr(u, "completion_tokens", 0))
 
-    embeddings = await asyncio.gather(*[embed(ctx) for ctx in contextualized_chunks])
-    if embeddings:
-        await validate_embedding_dim(len(embeddings[0]))
 
-    conn = await get_conn()
-    async with conn.transaction():
-        for i, (chunk, ctx_chunk, embedding) in enumerate(
-            zip(chunks, contextualized_chunks, embeddings)
-        ):
-            await conn.execute(
-                """
-                INSERT INTO chunks
-                  (source_id, notebook_id, chunk_index, original_text,
-                   contextualized_text, embedding)
-                VALUES (%s, %s, %s, %s, %s, %s::vector)
-                """,
-                (source_id, notebook_id, i, chunk, ctx_chunk, embedding),
-            )
+async def enrich_source(conn: sqlite3.Connection, router: Router, settings: Settings,
+                        source_id: int, force: bool = False) -> dict:
+    """DeepSeek contextualization over a PRIVATE source's pending chunks, re-embed
+    locally, mark enriched/failed. Public (context-3) sources need no enrichment."""
+    rows = conn.execute(
+        "SELECT id, chunk_index, original_text, enrichment_status, backend_id "
+        "FROM chunks WHERE source_id=? ORDER BY chunk_index", (source_id,)
+    ).fetchall()
+    if not rows:
+        return {"error": f"source {source_id} has no chunks"}
+    backend_id = rows[0]["backend_id"]
+    if not backend_id.startswith("bge"):
+        return {"enriched": 0, "reason": "public source is natively contextual (context-3)"}
 
-    return len(chunks), content_hash
+    texts = [r["original_text"] for r in rows]
+    targets = [r for r in rows if force or r["enrichment_status"] in ("pending", "failed")]
+    if not targets:
+        return {"enriched": 0, "reason": "nothing pending"}
+
+    client = _context_client(settings)
+    enriched = failed = calls = in_tok = out_tok = 0
+    for r in targets:
+        i = r["chunk_index"]
+        window = "\n".join(texts[max(0, i - CONTEXT_NEIGHBORS): i + CONTEXT_NEIGHBORS + 1])
+        try:
+            ctx, ui, uo = await _gen_context(client, settings.context_llm_model, window, r["original_text"])
+            calls += 1; in_tok += ui; out_tok += uo
+            ctext = f"{ctx}\n\n{r['original_text']}"
+            vec = await router.private.embed_query(ctext)
+            db.replace_vector(conn, backend_id, r["id"], vec)
+            conn.execute(
+                "UPDATE chunks SET contextualized_text=?, enrichment_status='enriched' WHERE id=?",
+                (ctext, r["id"]))
+            conn.commit(); enriched += 1
+        except Exception:
+            conn.execute("UPDATE chunks SET enrichment_status='failed' WHERE id=?", (r["id"],))
+            conn.commit(); failed += 1
+
+    if calls:
+        costs.record_cost(conn, source_id, settings.context_llm_model,
+                          api_calls=calls, input_tokens=in_tok, output_tokens=out_tok)
+    return {"enriched": enriched, "failed": failed, "processed": len(targets)}
