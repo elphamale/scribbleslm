@@ -14,6 +14,7 @@ token-fallback document) follow the public/private path:
 """
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import sqlite3
 from dataclasses import dataclass
@@ -95,13 +96,40 @@ def _windows(n: int, size: int = WINDOW_CHUNKS):
         yield i, min(i + size, n)
 
 
+def _prepare(doc_text: str, settings: Settings):
+    """Blocking CPU work (induction + chunking) — run off the event loop via to_thread."""
+    induction = induce(doc_text, cache=_profile_cache(settings))
+    return induction, build_chunks(doc_text, induction)
+
+
+async def run_ingest(conn: sqlite3.Connection, router: Router, settings: Settings,
+                     notebook_id: int, source_id: int, url: str, private: bool,
+                     enrich: bool) -> dict:
+    """Background ingest lifecycle: ingesting -> ready -> (optional) enrich. On error,
+    mark 'failed' but KEEP partial chunks (they stay queryable); never roll back."""
+    try:
+        conn.execute("UPDATE sources SET ingest_state='ingesting' WHERE id=?", (source_id,))
+        conn.commit()
+        summary = await ingest_source(conn, router, settings, notebook_id, source_id, url, private)
+        conn.execute("UPDATE sources SET ingest_state='ready' WHERE id=?", (source_id,))
+        conn.commit()
+        if enrich and summary.get("private"):
+            await enrich_source(conn, router, settings, source_id)
+        return summary
+    except Exception as e:
+        conn.execute("UPDATE sources SET ingest_state='failed', ingest_error=? WHERE id=?",
+                     (str(e)[:500], source_id))
+        conn.commit()
+        return {"error": str(e), "source_id": source_id}
+
+
 async def ingest_source(conn: sqlite3.Connection, router: Router, settings: Settings,
                         notebook_id: int, source_id: int, url: str, private: bool) -> dict:
-    doc_text = fetch_source(url)
+    doc_text = await asyncio.to_thread(fetch_source, url)        # blocking I/O off-loop
     content_hash = hashlib.sha256(doc_text.encode()).hexdigest()
-
-    induction = induce(doc_text, cache=_profile_cache(settings))
-    chunks = build_chunks(doc_text, induction)
+    induction, chunks = await asyncio.to_thread(_prepare, doc_text, settings)  # CPU off-loop
+    conn.execute("UPDATE sources SET chunks_planned=? WHERE id=?", (len(chunks), source_id))
+    conn.commit()  # denominator available to source_status before the embed loop starts
 
     eff_private = router.effective_private(private)
     backend_id: str | None = None

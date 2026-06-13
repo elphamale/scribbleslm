@@ -16,7 +16,7 @@ from .config import get_settings
 from .embeddings.bge_gguf import BgeM3GgufBackend
 from .embeddings.dispatcher import Dispatcher
 from .embeddings.voyage import VoyageBackend
-from .ingest import enrich_source, ingest_source
+from .ingest import enrich_source, ingest_source, run_ingest
 from .query import notebook_query as _notebook_query
 from .reranker import Reranker
 from .routing import Router
@@ -27,6 +27,7 @@ _conn = None
 _settings = None
 _router: Router | None = None
 _reranker: Reranker | None = None
+_bg_tasks: set = set()  # retain background ingest tasks so they aren't GC'd mid-flight
 
 
 def _ensure():
@@ -113,24 +114,20 @@ async def source_add(notebook_id: int, url: str, display_name: str | None = None
             return {"error": f"notebook {notebook_id} not found"}
         eff = router.effective_private(private)
         src = conn.execute(
-            "INSERT INTO sources(notebook_id, url, display_name, private) VALUES(?,?,?,?) "
-            "RETURNING id", (notebook_id, url, display_name, int(eff))).fetchone()["id"]
+            "INSERT INTO sources(notebook_id, url, display_name, private, ingest_state) "
+            "VALUES(?,?,?,?, 'pending') RETURNING id",
+            (notebook_id, url, display_name, int(eff))).fetchone()["id"]
         conn.commit()
-        try:
-            summary = await ingest_source(conn, router, settings, notebook_id, src, url, private)
-        except Exception:
-            # roll back the orphan source row so a failed add leaves no phantom source
-            db.purge_vectors_for_source(conn, src)
-            conn.execute("DELETE FROM sources WHERE id=?", (src,))
-            conn.commit()
-            raise
-        out = {"source_id": src, **summary}
-        if enrich and summary["private"]:
-            asyncio.create_task(enrich_source(conn, router, settings, src))
-            out["enrich"] = "started (background)"
-        elif enrich:
-            out["enrich"] = "skipped (public source is natively contextual)"
-        return out
+        # Background the embed (+enrich): return source_id immediately so the agent isn't
+        # blocked for the duration of a large ingest; chunks become queryable as they
+        # stream in. Poll source_status(source_id) for progress.
+        task = asyncio.create_task(
+            run_ingest(conn, router, settings, notebook_id, src, url, private, enrich))
+        _bg_tasks.add(task)
+        task.add_done_callback(_bg_tasks.discard)
+        return {"source_id": src, "ingest_state": "ingesting", "private": eff,
+                "note": "ingesting in background — poll source_status(source_id); "
+                        "chunks are queryable as they embed"}
     except Exception as e:
         if "unique" in str(e).lower():
             return {"error": f"source '{url}' already exists in this notebook"}
@@ -213,6 +210,39 @@ async def source_enrich(source_id: int, force: bool = False) -> dict:
     try:
         conn, router, settings = _ensure()
         return await enrich_source(conn, router, settings, source_id, force=force)
+    except Exception as e:
+        return {"error": str(e)}
+
+
+# ---------------------------------------------------------------------------
+# Status (pollable — stdio is request/response, so poll; there is no push/stream)
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+async def source_status(source_id: int) -> dict:
+    """Ingestion/enrichment status for a source, derived from current DB state. Poll
+    this to track progress (no streaming — stdio is request/response). Returns chunk
+    counts (total/embedded/pending/enriched/failed), the enrichment_status rollup,
+    `queryable` (true once any chunk is stored — partial coverage is searchable, and
+    failed-enrichment chunks stay queryable on their plain embeddings), backend, and a
+    terse human-readable `summary`. Retrieval itself is sub-second, so there is no
+    retrieval progress to report."""
+    try:
+        conn, _, _ = _ensure()
+        st = db.source_status(conn, source_id)
+        return st if st else {"error": f"source {source_id} not found"}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@mcp.tool()
+async def notebook_status(notebook_id: int) -> dict:
+    """Aggregate ingestion/enrichment status across all sources in a notebook — 'is my
+    corpus ready'. Same rollup as source_status, plus source_count."""
+    try:
+        conn, _, _ = _ensure()
+        st = db.notebook_status(conn, notebook_id)
+        return st if st else {"error": f"notebook {notebook_id} not found"}
     except Exception as e:
         return {"error": str(e)}
 

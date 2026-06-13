@@ -30,6 +30,9 @@ CREATE TABLE IF NOT EXISTS sources (
     content_hash  TEXT,
     private       INTEGER NOT NULL DEFAULT 0,   -- 0 public / 1 private
     backend_id    TEXT,                         -- backend used to embed this source
+    ingest_state  TEXT NOT NULL DEFAULT 'pending',  -- pending|ingesting|ready|failed (background ingest lifecycle)
+    ingest_error  TEXT,
+    chunks_planned INTEGER NOT NULL DEFAULT 0,  -- total chunks the ingest will produce (for embedded X/Y)
     ingested_at   TEXT NOT NULL DEFAULT (datetime('now')),
     -- per-source cost log
     api_calls         INTEGER NOT NULL DEFAULT 0,
@@ -98,6 +101,16 @@ def connect(db_path: str | Path) -> sqlite3.Connection:
 
 def init_schema(conn: sqlite3.Connection) -> None:
     conn.executescript(SCHEMA)
+    # idempotent migrations for DBs created before the background-ingest columns existed
+    for ddl in (
+        "ALTER TABLE sources ADD COLUMN ingest_state TEXT NOT NULL DEFAULT 'pending'",
+        "ALTER TABLE sources ADD COLUMN ingest_error TEXT",
+        "ALTER TABLE sources ADD COLUMN chunks_planned INTEGER NOT NULL DEFAULT 0",
+    ):
+        try:
+            conn.execute(ddl)
+        except sqlite3.OperationalError:
+            pass  # column already exists
     conn.commit()
 
 
@@ -207,6 +220,85 @@ def purge_vectors_for_source(conn: sqlite3.Connection, source_id: int) -> None:
 
 def purge_vectors_for_notebook(conn: sqlite3.Connection, notebook_id: int) -> None:
     _purge(conn, _chunk_rows(conn, "notebook_id = ?", notebook_id))
+
+
+# ---------------------------------------------------------------------------
+# ingestion/enrichment status (pollable; derived entirely from existing state)
+# ---------------------------------------------------------------------------
+
+def _terse(embedded: int, planned: int, pending: int, enriched: int, failed: int,
+           queryable: bool, ingest_state: str | None, error: str | None) -> str:
+    if ingest_state == "failed":
+        tail = ", partial results queryable" if queryable else ""
+        return f"ingest FAILED after {embedded} chunks" + (f": {error}" if error else "") + tail
+    if ingest_state in ("pending", "ingesting"):
+        denom = f"/{planned}" if planned else ""
+        return f"ingesting: embedded {embedded}{denom}" + (", queryable now" if queryable else ", not yet queryable")
+    # ready, or aggregate (ingest_state None)
+    if embedded == 0:
+        return "no chunks yet"
+    parts = [f"embedded {embedded}", "queryable now" if queryable else "not queryable"]
+    enrichable = pending + enriched + failed
+    if enrichable == 0:
+        parts.append("all chunks contextual (structural/public)")
+    elif pending > 0:
+        parts.append(f"enrichment pending: {enriched} enriched, {pending} pending"
+                     + (f", {failed} failed" if failed else ""))
+    else:
+        parts.append(f"enrichment complete: {enriched} enriched" + (f", {failed} failed" if failed else ""))
+    return ", ".join(parts)
+
+
+def _status_rollup(conn: sqlite3.Connection, col: str, val: int, base: dict, *,
+                   ingest_state: str | None = None, planned: int = 0,
+                   error: str | None = None) -> dict:
+    rows = conn.execute(
+        f"SELECT enrichment_status, COUNT(*) n FROM chunks WHERE {col} = ? GROUP BY enrichment_status",
+        (val,)).fetchall()
+    rollup = {r["enrichment_status"]: r["n"] for r in rows}
+    pending, enriched, failed = rollup.get("pending", 0), rollup.get("enriched", 0), rollup.get("failed", 0)
+    embedded = sum(rollup.values())            # chunks actually stored (each with its vector)
+    queryable = embedded > 0                    # partial coverage searchable; failed chunks keep plain embeddings
+    base.update({
+        "chunks_total": max(planned, embedded), # planned denominator once known; embedded climbs toward it
+        "chunks_embedded": embedded,
+        "chunks_planned": planned,
+        "chunks_pending": pending, "chunks_enriched": enriched, "chunks_failed": failed,
+        "enrichment_status": rollup, "queryable": queryable,
+        "summary": _terse(embedded, planned, pending, enriched, failed, queryable, ingest_state, error),
+    })
+    return base
+
+
+def source_status(conn: sqlite3.Connection, source_id: int) -> dict | None:
+    src = conn.execute(
+        "SELECT id, notebook_id, url, display_name, private, backend_id, ingested_at, "
+        "ingest_state, ingest_error, chunks_planned FROM sources WHERE id = ?", (source_id,)).fetchone()
+    if not src:
+        return None
+    base = {
+        "source_id": src["id"], "notebook_id": src["notebook_id"], "url": src["url"],
+        "display_name": src["display_name"], "private": bool(src["private"]),
+        "backend_id": src["backend_id"], "ingested_at": src["ingested_at"],
+        "ingest_state": src["ingest_state"], "ingest_error": src["ingest_error"],
+    }
+    return _status_rollup(conn, "source_id", source_id, base,
+                          ingest_state=src["ingest_state"], planned=src["chunks_planned"],
+                          error=src["ingest_error"])
+
+
+def notebook_status(conn: sqlite3.Connection, notebook_id: int) -> dict | None:
+    if not conn.execute("SELECT 1 FROM notebooks WHERE id = ?", (notebook_id,)).fetchone():
+        return None
+    srows = conn.execute(
+        "SELECT ingest_state, COUNT(*) n FROM sources WHERE notebook_id = ? GROUP BY ingest_state",
+        (notebook_id,)).fetchall()
+    state_counts = {r["ingest_state"]: r["n"] for r in srows}
+    planned = conn.execute("SELECT COALESCE(SUM(chunks_planned), 0) p FROM sources WHERE notebook_id = ?",
+                           (notebook_id,)).fetchone()["p"]
+    base = {"notebook_id": notebook_id, "source_count": sum(state_counts.values()),
+            "source_states": state_counts}
+    return _status_rollup(conn, "notebook_id", notebook_id, base, planned=planned)
 
 
 def _purge(conn: sqlite3.Connection, chunk_rows: list[tuple[int, str]]) -> None:
