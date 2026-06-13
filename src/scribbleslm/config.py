@@ -50,6 +50,12 @@ class Settings:
     profile_cache_dir: Path
     profile_synthesis: bool   # rung-4 LLM profile synthesis (default on)
 
+    # reranker (Milestone C) — DEFAULT OFF (token cost + latency)
+    reranker_enabled: bool
+    reranker_model: str          # local private reranker (self-exiting subprocess)
+    reranker_idle_exit: int      # seconds of idle before the subprocess exits
+    voyage_rerank_model: str     # public reranker (Voyage API)
+
 
 def _load_dotenv() -> None:
     """Populate os.environ from a .env file (cwd or ~/.scribbleslm), without
@@ -89,6 +95,10 @@ def get_settings() -> Settings:
         default_private=_bool(os.environ.get("DEFAULT_PRIVATE"), False),
         profile_cache_dir=_expand(os.environ.get("PROFILE_CACHE_DIR", str(home / "profiles"))),
         profile_synthesis=_bool(os.environ.get("PROFILE_SYNTHESIS"), True),
+        reranker_enabled=_bool(os.environ.get("RERANKER_ENABLED"), False),
+        reranker_model=os.environ.get("RERANKER_MODEL", "BAAI/bge-reranker-v2-m3"),
+        reranker_idle_exit=int(os.environ.get("RERANKER_IDLE_EXIT", "120")),
+        voyage_rerank_model=os.environ.get("VOYAGE_RERANK_MODEL", "rerank-2.5"),
     )
 
 

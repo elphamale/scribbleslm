@@ -51,12 +51,15 @@ exists (Dispatcher semaphore + token governor, R1); this is mostly a config flip
 - **Rung 5 (semantic segmentation) — DEFERRED (YAGNI).** No structureless source in the
   corpus (legislation is the least structureless text there is). Earns its place when
   commentary/transcripts/articles actually arrive.
-- **Digit-led numbered-point detection — now corpus-justified** (the NBU PDF needs it), but
-  tricky: розділ headings there aren't line-started, and naive `^\d+\.` matching risks
-  false positives on in-body numbered lists. Scope to docs/regions where keyword mining
-  returned nothing. Test fixture: the NBU PDF above. NBU regs meanwhile work via rung-6
-  (embedded + context-3-contextualized + queryable, just no breadcrumbs) — functional for
-  the few small regs in scope.
+- **Digit-led numbered-point detection — REQUIRED for the NBU shape; sequencing call, not a
+  priority call.** As of now NBU regs retrieve WITHOUT structural citation (flat rung-6
+  chunks, no пункт breadcrumb) — i.e. the generic-RAG failure mode the citator premise
+  exists to beat. Digit-led numbered-point detection is the fix. It is SEQUENCED AFTER C
+  (not deprioritized as trivial) specifically so its benefit is measured THROUGH the
+  hybrid+rerank stack rather than in isolation. Tricky parts: розділ headings in the NBU
+  PDF aren't line-started, and naive `^\d+\.` matching risks false positives on in-body
+  numbered lists — scope it to docs/regions where keyword mining returned nothing. Test
+  fixture: the NBU PDF above (bank.gov.ua Resolution_25072025_80).
 
 ## Milestone D refinements (induction)
 - **Digit-led numbered-point segmentation.** Line-mining only treats alpha-keyword+
@@ -104,9 +107,50 @@ in C — itself an open measurement.
 
 Do NOT pivot speculatively. Each trigger is a number to measure, not a plan to execute.
 
+## Unrun paths (verify when first exercised)
+- Local reranker CrossEncoder model-load (`BAAI/bge-reranker-v2-m3`, ~2GB + torch) is
+  code-complete but UNRUN — the self-exiting subprocess lifecycle/protocol/routing are
+  tested via the stdlib `stub` model; only the real model load is unverified. Verify when
+  the reranker is first enabled on the private path.
+- Rung-4 LLM profile synthesis + private-path DeepSeek enrichment — both code-complete,
+  unrun (no DeepSeek key); test together when a key lands.
+
 ## Known carry-overs
 - v1 modules `server.py`, `ingest.py`, `query.py` are Postgres-coupled and dormant;
   they are rewritten in Milestone B against the SQLite + routing foundation.
   `sources.py` (URL/PDF/text extraction) is reused as-is.
-- Ukrainian FTS5 lexical is inflection-limited (no stemming; bge-m3 GGUF is dense-only).
-  Mitigation (prefix/trigram tokenizer or query expansion) is a Milestone C task.
+- **Ukrainian FTS5 inflection gap — MEASURED (C-2), trigger now POSITIVE, decision pending.**
+  unicode61 has no stemming and FTS5 is the entire lexical channel (GGUF sparse dense-only).
+  Tax index: inter-inflection set-overlap Jaccard 0.00–0.15 (exact); prefix (now the
+  fts_search default) helps only for suffix-appending inflections (платник→платника
+  0.15→0.56), not stem-changing (податок→податку: no help). Dense channel (voyage-context-3)
+  is inflection-robust so HYBRID degrades gracefully, but mode=lexical / exact-citation
+  lookups miss. NOT auto-resolved by RRF. Mitigation options, RANKED:
+  1. **FTS5 trigram tokenizer — PROBED, INSUFFICIENT on the decisive class.** Two-class
+     Jaccard (Tax, 5520 chunks, non-destructive parallel measure): (a) suffix-only
+     0.11→0.19 (helps, uneven — платник~платника 0.15→0.56, but особу/сумою barely move);
+     (b) stem-alternating чергування **0.08→0.08, ZERO benefit** (податок↔податку,
+     дохід↔доходу, рік↔року — чергування mutates the trigrams). Cost: 7.0× index
+     (1.9→13.4MB), mild substring false-positives (сума→сумарна 34). Verdict: trigram
+     does NOT solve stem-alternation. Not adopted (no code change). Joint decision pending.
+  2. Query expansion to inflected forms — DOWN-RANKED: handles suffix inflection but stumbles
+     on чергування (stem alternation), the same hard cases, and adds a dependency.
+  3. Ukrainian lemmatizer at index+query (pymorphy/lang-uk) — DOWN-RANKED, same reason:
+     morphological tools handle suffixes but чергування/fleeting-vowel stems are the weak spot,
+     plus a heavyweight dependency.
+  4. Learned sparse vectors (non-GGUF bge-m3 path or Qdrant Edge sparse) — ESCALATION,
+     **does NOT graduate (RESOLVED 2026-06-14, decision branch #2 = latent/unreached).**
+
+  RESOLUTION (cross-form recall + dense-bridge measure, replacing the conflated Jaccard):
+  - Cross-form LEXICAL recall (form-A query retrieving form-B-only chunks): suffix-only 0.10,
+    stem-alternating 0.00 → the lexical gap is REAL (not a Jaccard artifact).
+  - BUT default mode is hybrid (always-on) and DENSE bridges inflection: context-3 cosine
+    between inflected forms 0.86 (suffix) / 0.92 (stem-alternating); end-to-end dense
+    cross-form recall 0.43 vs lexical 0.05 (~8.5×; 0.43 depressed by tax-relevant distractors).
+  - Only degraded surface = mode=lexical on inflected queries (not the default path; exact
+    numeric citation «пункт 14.1.159» is uninflected, unaffected). In hybrid, RRF unions
+    dense+lexical so dense covers the inflected chunks lexical misses.
+  => KNOWN LIMITATION, masked by hybrid. Lexical channel DONE as-is. Option 4 re-opens ONLY
+     if a real-usage pure-lexical/inflected path emerges. (Trigram: rejected — see below.)
+- C-1 MEASURED: query latency 94% Voyage round-trip, KNN 3.5% (10.5ms @ 5520 vec) →
+  Qdrant-speed trigger does NOT fire; Qdrant stays settled-deferred.

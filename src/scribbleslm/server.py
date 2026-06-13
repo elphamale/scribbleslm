@@ -18,6 +18,7 @@ from .embeddings.dispatcher import Dispatcher
 from .embeddings.voyage import VoyageBackend
 from .ingest import enrich_source, ingest_source
 from .query import notebook_query as _notebook_query
+from .reranker import Reranker
 from .routing import Router
 
 mcp = FastMCP("ScribblesLM")
@@ -25,11 +26,12 @@ mcp = FastMCP("ScribblesLM")
 _conn = None
 _settings = None
 _router: Router | None = None
+_reranker: Reranker | None = None
 
 
 def _ensure():
     """Lazy init: clean startup even with missing keys; backends validate on use."""
-    global _conn, _settings, _router
+    global _conn, _settings, _router, _reranker
     if _conn is None:
         _settings = get_settings()
         _conn = db.connect(_settings.db_path)
@@ -37,6 +39,7 @@ def _ensure():
         disp = Dispatcher(concurrency=_settings.voyage_concurrency,
                           tpm_ceiling=_settings.voyage_tpm_ceiling)
         _router = Router(_settings, VoyageBackend(_settings, disp), BgeM3GgufBackend(_settings))
+        _reranker = Reranker(_settings)
     return _conn, _router, _settings
 
 
@@ -220,14 +223,15 @@ async def source_enrich(source_id: int, force: bool = False) -> dict:
 
 @mcp.tool()
 async def notebook_query(notebook_id: int, query: str, top_k: int = 10,
-                         private: bool | None = None) -> dict:
-    """Semantic search within a notebook (dense + RRF across backends). Returns raw
-    chunks for the calling agent to synthesize. Set private=true for a sensitive query
-    so it is never sent to the remote backend (searches only local spaces + flags any
-    excluded remote spaces)."""
+                         private: bool | None = None, mode: str = "hybrid") -> dict:
+    """Hybrid search within a notebook: dense KNN + FTS5 lexical, fused with RRF.
+    Returns raw chunks for the calling agent to synthesize. mode = hybrid | dense |
+    lexical. Set private=true for a sensitive query so it is never dense-embedded via
+    the remote backend (FTS5 is local and still runs); excluded remote spaces are
+    flagged. Per-stage latency is returned under 'latency_ms'."""
     try:
         conn, router, _ = _ensure()
-        return await _notebook_query(conn, router, notebook_id, query, top_k, private)
+        return await _notebook_query(conn, router, notebook_id, query, top_k, private, mode, _reranker)
     except Exception as e:
         return {"error": str(e)}
 
