@@ -179,3 +179,7 @@ others are induced automatically and cached by structural fingerprint.
 - For **morphologically-rich / inflected languages**, the pure-lexical channel (FTS5, no
   stemming) misses inflected word forms; the default **hybrid** query mode covers this via
   dense embeddings.
+
+## License
+[Polyform Noncommercial 1.0.0](https://polyformproject.org/licenses/noncommercial/1.0.0)
+© 2026 elphamale
