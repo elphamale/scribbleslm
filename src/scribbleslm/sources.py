@@ -74,7 +74,7 @@ def _check_local_path(path: str, documents_root: Path | None) -> Path:
 def fetch_url(url: str, max_bytes: int = 50 * 1024 * 1024, timeout: int = 30) -> str:
     _check_url(url)
     import trafilatura
-    downloaded = trafilatura.fetch_url(url, no_ssl=False, config=None)
+    downloaded = trafilatura.fetch_url(url, no_ssl=False)
     if not downloaded:
         raise ValueError(f"Failed to fetch URL: {url}")
     if max_bytes and len(downloaded.encode()) > max_bytes:
