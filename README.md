@@ -1,102 +1,112 @@
 # ScribblesLM
 
-ScribblesLM is a self-hosted, notebook-scoped RAG pipeline with contextual retrieval, delivered as an MCP server. Documents (URLs, PDFs, plain text) are ingested into named persistent notebooks; queries return semantically ranked raw chunks for the calling agent to synthesize. Transport is stdio, making it a drop-in tool for any MCP-compatible agent.
+Notebook-scoped RAG over your own corpora, delivered as a **stdio MCP server**. Documents
+(URLs, PDFs, plain text) are ingested into named persistent notebooks; queries return raw,
+**breadcrumbed** chunks for the calling agent to cite and synthesize. The breadcrumb is the
+document's own heading hierarchy — `Part › Chapter › Section › Clause`, `Article › §`,
+`Розділ › Стаття › Пункт`, whatever the source uses — so answers carry a real citation, not
+just a similarity score.
+
+It works on any **structured document** whose sections are marked by consistent keyword
+headings (legal codes, contracts, regulations, standards, technical specs, manuals…). The
+chunking profile is **induced from each document**, not hard-coded.
+
+Embeddings are **sensitivity-routed**: public docs → Voyage (fast, contextual); private docs
+→ a local **bge-m3 GGUF** that never leaves the host. Storage is **SQLite + sqlite-vec +
+FTS5** — no Docker, no daemon, near-zero idle footprint.
 
 ## Prerequisites
 
-- Docker (for the pgvector container)
-- [uv](https://docs.astral.sh/uv/) (Python package manager)
-- [Ollama](https://ollama.com) (local embeddings)
-- DeepSeek API key (context generation during ingestion)
+- [uv](https://docs.astral.sh/uv/) (Python package manager / runner)
+- A **Voyage API key** — required for the public embedding path
+- *(private path only)* a **bge-m3 GGUF** model file — see install step 3
+- *(optional)* a DeepSeek / OpenAI-compatible key for private-path contextualization
 
-## Quickstart
+## Install
 
 ```bash
-# 1. Clone the repo
+# 1. Clone
 git clone https://github.com/elphamale/scribbleslm
 cd scribbleslm
 
-# 2. Install Ollama and pull the embedding model
-curl -fsSL https://ollama.com/install.sh | sh
-ollama pull bge-m3
+# 2. Configure env (secrets live OUTSIDE the repo; .env is git-ignored)
+mkdir -p ~/.scribbleslm
+cp .env.example ~/.scribbleslm/.env
+#    then edit ~/.scribbleslm/.env and set VOYAGE_API_KEY=<your key>
 
-# 3. Configure
-cp .env.example .env
-# Edit .env and fill in your DeepSeek API key
+# 3. (private path only) download the local embedding model (~445 MB, ungated)
+uvx --from huggingface_hub hf download gpustack/bge-m3-GGUF bge-m3-Q5_K_M.gguf \
+    --local-dir ~/.scribbleslm/models
+#    Skip if you only ingest PUBLIC sources. Adding a private source without this
+#    model returns a clear error, not a crash.
 
-# 4. Start the database
-docker compose up -d
-
-# 5. Run the server
-uv run scribbleslm
+# 4. Smoke test — should print one JSON line listing 11 tools
+{ printf '{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"smoke","version":"0"}}}\n{"jsonrpc":"2.0","method":"notifications/initialized"}\n{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}\n'; sleep 3; } | uv run scribbleslm
 ```
 
-Add to your agent's MCP config:
+The first `uv run` resolves dependencies (including a prebuilt `llama-cpp-python` CPU wheel
+via `pyproject`'s configured index) — it may take a minute. Subsequent runs are instant.
+
+## MCP client config
+
+Add to your agent's MCP config. **Secrets are not inlined** — the server reads
+`~/.scribbleslm/.env` at startup:
 
 ```json
 {
   "mcpServers": {
     "scribbleslm": {
       "command": "uv",
-      "args": ["--directory", "/path/to/scribbleslm", "run", "scribbleslm"],
-      "env": {
-        "SCRIBBLESLM_DB_URL": "postgresql://scribbleslm:scribbleslm@localhost:5433/scribbleslm",
-        "CONTEXT_LLM_BASE_URL": "https://api.deepseek.com/v1",
-        "CONTEXT_LLM_API_KEY": "your_deepseek_key",
-        "CONTEXT_LLM_MODEL": "deepseek-v4-flash",
-        "OLLAMA_BASE_URL": "http://localhost:11434",
-        "OLLAMA_EMBEDDING_MODEL": "bge-m3"
-      }
+      "args": ["--directory", "/absolute/path/to/scribbleslm", "run", "scribbleslm"]
     }
   }
 }
 ```
 
-## MCP Tools
+## Environment (`~/.scribbleslm/.env`)
 
-**Notebook management**
-- `notebook_create` — create a named notebook
-- `notebook_list` — list all notebooks with source counts
-- `notebook_delete` — delete a notebook and all its data
+| Variable | Required | Notes |
+|---|---|---|
+| `VOYAGE_API_KEY` | **yes** | public embedding path (voyage-context-3) |
+| `VOYAGE_MODEL` | no | default `voyage-context-3` |
+| `PRIVATE_EMBEDDING_MODEL_PATH` | private path | default `~/.scribbleslm/models/bge-m3-Q5_K_M.gguf` |
+| `CONTEXT_LLM_API_KEY` | private enrich | **placeholder by default** — see below |
+| `DEFAULT_PRIVATE` | no | default `false` (public) |
+| `RERANKER_ENABLED` | no | default `false` (reranker off) |
 
-**Source management**
-- `source_add` — fetch and ingest a URL, PDF, or text file into a notebook
-- `source_list` — list sources in a notebook with chunk counts
-- `source_refresh` — re-fetch a source and re-ingest only if content changed
-- `source_delete` — delete a source and its chunks
+**Unrun without a DeepSeek key:** `CONTEXT_LLM_API_KEY` ships as a placeholder. Until you
+set it, the **private-path DeepSeek enrichment** and **LLM profile synthesis** paths do not
+run (the rest works; private docs are embedded and queryable, just not DeepSeek-
+contextualized). The local reranker's model-load path is likewise exercised only when
+`RERANKER_ENABLED=true`.
 
-**Query**
-- `notebook_query` — semantic search within a notebook; returns raw ranked chunks
+## How chunking works (why the breadcrumbs)
 
-## Switching embedding models
+Each document is run through an **induction ladder** that derives its structure:
+format-native (markdown headings / PDF table-of-contents) → a cached profile → **line-shape
+mining** (detects recurring `Keyword + Number/Roman` headings — `Article 12`, `Section 4`,
+`Розділ II`, `§ 3` — with no model) → optional LLM synthesis → semantic segmentation →
+plain token-splitting as the floor. The winning profile segments the document into
+heading-aligned chunks, each carrying its breadcrumb; oversized sections are token-split but
+inherit the breadcrumb. A small pre-warmed profile ships for one common document family;
+others are induced automatically and cached by structural fingerprint.
 
-Change `OLLAMA_EMBEDDING_MODEL` in your `.env` and pull the new model with `ollama pull <model>`. If the new model has a different vector dimension, you must drop and recreate the database:
+## Tools (11)
 
-```bash
-docker compose down -v
-docker compose up -d
-```
+`notebook_create` · `notebook_list` · `notebook_delete` · `source_add` · `source_list` ·
+`source_refresh` · `source_delete` · `source_enrich` · `source_status` · `notebook_status`
+· `notebook_query`
 
-Then re-ingest your sources. ScribblesLM will detect the new dimension on first use and store it.
+Ingestion is **backgrounded**: `source_add` returns `source_id` immediately and chunks
+become queryable as they embed — poll `source_status(source_id)` for progress.
 
-To point at a remote Ollama instance, set `OLLAMA_BASE_URL` to its address.
+## Known limitations
 
-## Switching context LLM
-
-Any OpenAI-compatible API works. Set in `.env`:
-
-```env
-CONTEXT_LLM_BASE_URL=https://api.openai.com/v1
-CONTEXT_LLM_API_KEY=your_openai_key
-CONTEXT_LLM_MODEL=gpt-4o-mini
-```
-
-No restart of the database required.
-
-## Notes on ingestion cost and speed
-
-- One DeepSeek call is made per chunk during ingestion (contextual retrieval technique).
-- Up to 8 context generation calls run concurrently; 429 responses are retried with exponential backoff.
-- Embeddings are generated locally via Ollama — no rate limit, ~10–50ms per chunk.
-- The Ukrainian Criminal Code (~1031 chunks) ingests in approximately 5–10 minutes depending on DeepSeek server load.
-- `source_refresh` is a no-op if the content hash has not changed — safe to call frequently.
+- Without `CONTEXT_LLM_API_KEY`: private-path enrichment + LLM profile synthesis unrun.
+- Documents whose structure is carried only by **typography** (font size/bold) or by
+  **bare digit-led numbering** (`1.`, `1.1.`), and PDFs with **no embedded table of
+  contents**, fall back to plain token chunking — **no fine-grained breadcrumbs** (coarser
+  citation). Heading-keyword–structured documents get full breadcrumbs.
+- For **morphologically-rich / inflected languages**, the pure-lexical channel (FTS5, no
+  stemming) misses inflected word forms; the default **hybrid** mode covers this via dense
+  embeddings.
