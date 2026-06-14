@@ -107,6 +107,21 @@ in C — itself an open measurement.
 
 Do NOT pivot speculatively. Each trigger is a number to measure, not a plan to execute.
 
+## Deferred from security/bug audit (2026-06-14)
+- **BUG-5 / OPT-1: voyage-4-lite quality unmeasured; concurrency disabled.** The fallback
+  model (voyage-4-lite) has never been benchmarked against any corpus — retrieval quality
+  during a rate-limit event is unknown. Measuring requires a corpus eval harness (not yet
+  built) and a triggered rate-limit scenario. VOYAGE_CONCURRENCY=1 (serial) by design for
+  now; the dispatcher semaphore is the concurrency lever, but enabling parallel batching on
+  context-3 requires the window-partitioning work to preserve contextual attention (Milestone
+  B backlog). Both unblocked when the eval harness exists.
+- **OPT-3: profile cache hit rate not measured.** No counter for fingerprint hits/misses. A
+  mis-hit on a non-statute corpus produces wrong chunks silently. Add telemetry when a
+  second non-Ukrainian corpus is first tested — not before (premature for one corpus).
+- **SEC-2 path jail default.** SCRIBBLESLM_DOCUMENTS_ROOT defaults to empty (no jail) to
+  preserve backward compat with local-file ingestion. The opt-in jail is documented in
+  .env.example; tighten the default once a standard documents dir convention is established.
+
 ## Unrun paths (verify when first exercised)
 - Local reranker CrossEncoder model-load (`BAAI/bge-reranker-v2-m3`, ~2GB + torch) is
   code-complete but UNRUN — the self-exiting subprocess lifecycle/protocol/routing are

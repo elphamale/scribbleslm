@@ -162,27 +162,36 @@ async def source_list(notebook_id: int) -> list[dict]:
 
 
 @mcp.tool()
-async def source_refresh(notebook_id: int, source_id: int) -> dict:
-    """Re-fetch a source; re-ingest only if its content hash changed."""
+async def source_refresh(notebook_id: int, source_id: int,
+                         enrich: bool = False) -> dict:
+    """Re-fetch a source; re-ingest in background only if content hash changed.
+    Pass enrich=true to re-enrich private sources after re-ingest (matches source_add)."""
     try:
+        import hashlib
+        from .sources import fetch_source
         conn, router, settings = _ensure()
         s = conn.execute("SELECT url, content_hash, private FROM sources WHERE id=? AND notebook_id=?",
                          (source_id, notebook_id)).fetchone()
         if not s:
             return {"error": f"source {source_id} not found in notebook {notebook_id}"}
-        from .ingest import chunk_text
-        from .sources import fetch_source
-        import hashlib
-        new_hash = hashlib.sha256(fetch_source(s["url"]).encode()).hexdigest()
+        new_text = await asyncio.to_thread(
+            fetch_source, s["url"], settings.documents_root, settings.max_document_bytes)
+        new_hash = hashlib.sha256(new_text.encode()).hexdigest()
         if new_hash == s["content_hash"]:
             return {"refreshed": False, "reason": "content unchanged"}
         old = conn.execute("SELECT COUNT(*) n FROM chunks WHERE source_id=?", (source_id,)).fetchone()["n"]
         db.purge_vectors_for_source(conn, source_id)
         conn.execute("DELETE FROM chunks WHERE source_id=?", (source_id,))
+        conn.execute("UPDATE sources SET ingest_state='pending', ingest_error=NULL, "
+                     "chunks_planned=0 WHERE id=?", (source_id,))
         conn.commit()
-        summary = await ingest_source(conn, router, settings, notebook_id, source_id,
-                                      s["url"], bool(s["private"]))
-        return {"refreshed": True, "old_chunk_count": old, "new_chunk_count": summary["chunk_count"]}
+        task = asyncio.create_task(
+            run_ingest(conn, router, settings, notebook_id, source_id, s["url"],
+                       bool(s["private"]), enrich))
+        _bg_tasks.add(task); task.add_done_callback(_bg_tasks.discard)
+        return {"refreshed": True, "old_chunk_count": old, "source_id": source_id,
+                "ingest_state": "ingesting",
+                "note": "re-ingesting in background — poll source_status(source_id)"}
     except Exception as e:
         return {"error": str(e)}
 

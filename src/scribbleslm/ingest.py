@@ -125,7 +125,9 @@ async def run_ingest(conn: sqlite3.Connection, router: Router, settings: Setting
 
 async def ingest_source(conn: sqlite3.Connection, router: Router, settings: Settings,
                         notebook_id: int, source_id: int, url: str, private: bool) -> dict:
-    doc_text = await asyncio.to_thread(fetch_source, url)        # blocking I/O off-loop
+    doc_text = await asyncio.to_thread(
+        fetch_source, url,
+        settings.documents_root, settings.max_document_bytes)     # blocking I/O off-loop
     content_hash = hashlib.sha256(doc_text.encode()).hexdigest()
     induction, chunks = await asyncio.to_thread(_prepare, doc_text, settings)  # CPU off-loop
     conn.execute("UPDATE sources SET chunks_planned=? WHERE id=?", (len(chunks), source_id))

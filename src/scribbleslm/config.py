@@ -50,6 +50,10 @@ class Settings:
     profile_cache_dir: Path
     profile_synthesis: bool   # rung-4 LLM profile synthesis (default on)
 
+    # security
+    documents_root: Path | None   # if set, local file paths must resolve inside this dir
+    max_document_bytes: int       # 0 = unlimited (not recommended)
+
     # reranker (Milestone C) — DEFAULT OFF (token cost + latency)
     reranker_enabled: bool
     reranker_model: str          # local private reranker (self-exiting subprocess)
@@ -95,6 +99,9 @@ def get_settings() -> Settings:
         default_private=_bool(os.environ.get("DEFAULT_PRIVATE"), False),
         profile_cache_dir=_expand(os.environ.get("PROFILE_CACHE_DIR", str(home / "profiles"))),
         profile_synthesis=_bool(os.environ.get("PROFILE_SYNTHESIS"), True),
+        documents_root=_expand(os.environ["SCRIBBLESLM_DOCUMENTS_ROOT"])
+            if os.environ.get("SCRIBBLESLM_DOCUMENTS_ROOT") else None,
+        max_document_bytes=int(os.environ.get("SCRIBBLESLM_MAX_DOCUMENT_BYTES", str(50 * 1024 * 1024))),
         reranker_enabled=_bool(os.environ.get("RERANKER_ENABLED"), False),
         reranker_model=os.environ.get("RERANKER_MODEL", "BAAI/bge-reranker-v2-m3"),
         reranker_idle_exit=int(os.environ.get("RERANKER_IDLE_EXIT", "120")),

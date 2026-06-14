@@ -55,10 +55,10 @@ class VoyageBackend(EmbeddingBackend):
         out: list[list[Vector]] = []
         for doc in req.documents:
             tok = self._doc_tokens(doc)
-            if self._contextual and tok > CONTEXT_WINDOW_TOKENS:
+            if tok > CONTEXT_WINDOW_TOKENS:
                 raise ValueError(
-                    f"document of {tok} tokens exceeds the {CONTEXT_WINDOW_TOKENS} "
-                    f"context-3 window — window it via the chunker before embedding"
+                    f"document of {tok} tokens exceeds the {CONTEXT_WINDOW_TOKENS}-token "
+                    f"ceiling for model '{self.backend_id}' — window it via the chunker"
                 )
             vecs = await self._dispatcher.run(lambda d=doc: self._embed_doc(d), tokens=tok)
             if self._dim is None and vecs:

@@ -12,9 +12,12 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import select
 import subprocess
 import sys
 from pathlib import Path
+
+_RERANKER_IO_TIMEOUT = 120  # seconds; a single cross-encoder pass on 30 docs << 1 min
 
 from .config import Settings
 from .embeddings.base import PrivacyViolation
@@ -47,6 +50,10 @@ class LocalReranker:
             try:
                 proc.stdin.write(json.dumps({"query": query, "documents": docs}) + "\n")
                 proc.stdin.flush()
+                ready, _, _ = select.select([proc.stdout], [], [], _RERANKER_IO_TIMEOUT)
+                if not ready:
+                    proc.kill(); self._proc = None
+                    raise TimeoutError(f"reranker worker did not respond within {_RERANKER_IO_TIMEOUT}s")
                 line = proc.stdout.readline()
                 if not line:
                     raise BrokenPipeError("reranker worker closed")
