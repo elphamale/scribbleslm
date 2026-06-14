@@ -69,6 +69,10 @@ conversation, call `notebook_list` (or `source_list`) first.
 
 ## Honest limitations you must respect
 
+- **Validated only on Ukrainian legal codes.** The whole pipeline was tested on that corpus;
+  other document families, jurisdictions, and languages are **unverified**. The design is
+  general and should extend, but do not overstate confidence on untested corpora — if
+  results look thin or mis-cited on a new corpus, say so to the user rather than asserting.
 - **Documents without keyword headings** — structure carried only by typography (font/bold)
   or by bare digit-led numbering (`1.`, `1.1.`), and PDFs with no embedded table of contents
   — ingest via token fallback and carry **no fine-grained breadcrumbs**. Their citations are
